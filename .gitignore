@@ -1,0 +1,53 @@
+# Python
+.venv/
+venv/
+hpc_venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / OS
+.DS_Store
+.idea/
+.idea/*
+.vscode/
+__MACOSX/
+
+# Downloaded datasets / archives
+data/*
+!data/.gitkeep
+*.tar.gz
+*.tgz
+*.zip
+
+# HPC / runtime artifacts
+*.log
+*.pid
+slurm-*.out
+slurm.*.out
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Generated numerical scratch
+*.npy
+*.npz
+
+# Generated experiment outputs
+results/*
+!results/.gitkeep
+
+# Generated figures
+figures/*
+!figures/.gitkeep
+
+# Old exploratory work kept locally
+archive/
+archive/*
