@@ -1,16 +1,39 @@
 """
-Combine per-seed boundary-fidelity results and summarize them across seeds.
+Combine and summarize Experiment 1 boundary-fidelity results.
 
-Inputs:
+This script preserves the two complementary analyses in Experiment 1:
+
+    1. Decision-tree capacity sweep
+       Summarized across tree depths and random seeds.
+
+    2. Surrogate-family robustness
+       Summarized across the designated representative configuration
+       for each surrogate family.
+
+Inputs
+------
+Preferred HPC / per-seed input:
     results/boundary_fidelity/boundary_fidelity_seed_*.csv
 
-Outputs:
+If no per-seed files are found, an existing:
     results/boundary_fidelity/runs.csv
+is summarized directly.
+
+Outputs
+-------
+    results/boundary_fidelity/runs.csv
+
+        All individual experimental observations.
+
     results/boundary_fidelity/summary.csv
 
-The raw `runs.csv` preserves every individual experimental observation.
-The summary groups results by dataset, surrogate depth, boundary definition,
-and boundary-region width, then reports means and variation across seeds.
+        Backward-compatible summary of the decision-tree capacity sweep.
+        This is the summary used by the original boundary-fidelity figure.
+
+    results/boundary_fidelity/family_summary.csv
+
+        Cross-family robustness summary using only the designated
+        representative configuration from each surrogate family.
 """
 
 from pathlib import Path
@@ -21,84 +44,95 @@ import pandas as pd
 RESULT_DIR = Path("results/boundary_fidelity")
 INPUT_PATTERN = "boundary_fidelity_seed_*.csv"
 
+RUNS_PATH = RESULT_DIR / "runs.csv"
+TREE_SUMMARY_PATH = RESULT_DIR / "summary.csv"
+FAMILY_SUMMARY_PATH = RESULT_DIR / "family_summary.csv"
 
-def main():
-    files = sorted(RESULT_DIR.glob(INPUT_PATTERN))
 
-    if not files:
-        raise FileNotFoundError(
-            f"No files matching {RESULT_DIR / INPUT_PATTERN}"
+METRIC_COLS = [
+    "teacher_accuracy",
+    "global_fidelity",
+    "aurc",
+    "n_boundary",
+    "boundary_fidelity",
+    "boundary_gap",
+    "boundary_set_jaccard",
+    "boundary_overlap_n",
+    "boundary_union_n",
+]
+
+
+def normalize_bool_column(series):
+    """
+    Robustly interpret boolean columns after CSV loading.
+    """
+    if pd.api.types.is_bool_dtype(series):
+        return series
+
+    return (
+        series.astype(str)
+        .str.strip()
+        .str.lower()
+        .map(
+            {
+                "true": True,
+                "false": False,
+                "1": True,
+                "0": False,
+            }
         )
-
-    print(f"Found {len(files)} seed files.")
-
-    frames = [pd.read_csv(path) for path in files]
-    runs = pd.concat(frames, ignore_index=True)
-
-    # Basic integrity checks.
-    seeds = sorted(runs["seed"].unique())
-
-    print(f"Seeds found: {seeds}")
-    print(f"Total rows: {len(runs)}")
-
-    # Preserve all individual runs.
-    runs = runs.sort_values(
-        [
-            "dataset",
-            "seed",
-            "depth",
-            "boundary_fraction",
-            "boundary_type",
-        ]
     )
 
-    runs.to_csv(
-        RESULT_DIR / "runs.csv",
-        index=False,
-    )
 
-    # Summarize across random seeds.
-    group_cols = [
-        "dataset",
-        "depth",
-        "boundary_type",
-        "boundary_fraction",
+def flatten_columns(df):
+    """
+    Flatten pandas MultiIndex aggregation columns.
+
+    Example:
+        ('global_fidelity', 'mean')
+        -> global_fidelity_mean
+    """
+    df.columns = [
+        "_".join(
+            str(part)
+            for part in col
+            if part
+        )
+        if isinstance(col, tuple)
+        else col
+        for col in df.columns
     ]
 
-    metric_cols = [
-        "teacher_accuracy",
-        "global_fidelity",
-        "aurc",
-        "n_boundary",
-        "boundary_fidelity",
-        "boundary_gap",
-        "boundary_set_jaccard",
-        "boundary_overlap_n",
-        "boundary_union_n",
-    ]
+    return df
 
+
+def summarize(
+    runs,
+    group_cols,
+):
+    """
+    Compute mean/std summaries and number of independent seeds.
+    """
     summary = (
-        runs.groupby(group_cols)[metric_cols]
+        runs.groupby(
+            group_cols,
+            dropna=False,
+        )[METRIC_COLS]
         .agg(["mean", "std"])
         .reset_index()
     )
 
-    # Flatten pandas' multi-level column names:
-    # ('global_fidelity', 'mean') -> global_fidelity_mean
-    summary.columns = [
-        "_".join(
-            str(part) for part in col if part
-        )
-        if isinstance(col, tuple)
-        else col
-        for col in summary.columns
-    ]
+    summary = flatten_columns(summary)
 
-    # Number of independent seeds in each condition.
     n_seeds = (
-        runs.groupby(group_cols)["seed"]
+        runs.groupby(
+            group_cols,
+            dropna=False,
+        )["seed"]
         .nunique()
-        .reset_index(name="n_seeds")
+        .reset_index(
+            name="n_seeds"
+        )
     )
 
     summary = summary.merge(
@@ -107,17 +141,354 @@ def main():
         how="left",
     )
 
-    summary = summary.sort_values(group_cols)
+    return summary.sort_values(
+        group_cols
+    )
 
-    summary.to_csv(
-        RESULT_DIR / "summary.csv",
-        index=False,
+
+def load_runs():
+    """
+    Load per-seed result files when available.
+
+    If no per-seed files exist, summarize an existing runs.csv instead.
+    """
+    files = sorted(
+        RESULT_DIR.glob(
+            INPUT_PATTERN
+        )
+    )
+
+    if files:
+        print(
+            f"Found {len(files)} "
+            f"per-seed result files."
+        )
+
+        frames = [
+            pd.read_csv(path)
+            for path in files
+        ]
+
+        runs = pd.concat(
+            frames,
+            ignore_index=True,
+        )
+
+    elif RUNS_PATH.exists():
+        print(
+            "No per-seed files found; "
+            f"using {RUNS_PATH}."
+        )
+
+        runs = pd.read_csv(
+            RUNS_PATH
+        )
+
+    else:
+        raise FileNotFoundError(
+            "Could not find either "
+            f"{RESULT_DIR / INPUT_PATTERN} "
+            f"or {RUNS_PATH}."
+        )
+
+    return runs
+
+
+def validate_schema(runs):
+    """
+    Ensure results were generated by the multi-family Experiment 1 script.
+    """
+    required = {
+        "dataset",
+        "seed",
+        "surrogate_family",
+        "surrogate_config",
+        "complexity_name",
+        "complexity_value",
+        "is_family_reference",
+        "is_tree_capacity_sweep",
+        "depth",
+        "teacher_accuracy",
+        "n_test",
+        "global_fidelity",
+        "aurc",
+        "boundary_type",
+        "boundary_fraction",
+        "n_boundary",
+        "boundary_fidelity",
+        "boundary_gap",
+        "boundary_set_jaccard",
+        "boundary_overlap_n",
+        "boundary_union_n",
+    }
+
+    missing = (
+        required
+        - set(runs.columns)
+    )
+
+    if missing:
+        raise ValueError(
+            "Results are missing columns "
+            "required by the updated "
+            "Experiment 1 summarizer:\n"
+            f"{sorted(missing)}\n\n"
+            "Rerun Experiment 1 using "
+            "the multi-family version "
+            "of 01_boundary_fidelity.py."
+        )
+
+
+def main():
+    RESULT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    runs = load_runs()
+
+    validate_schema(runs)
+
+    runs[
+        "is_family_reference"
+    ] = normalize_bool_column(
+        runs[
+            "is_family_reference"
+        ]
+    )
+
+    runs[
+        "is_tree_capacity_sweep"
+    ] = normalize_bool_column(
+        runs[
+            "is_tree_capacity_sweep"
+        ]
+    )
+
+    # -------------------------------------------------------------
+    # Basic integrity checks
+    # -------------------------------------------------------------
+
+    seeds = sorted(
+        runs["seed"].unique()
+    )
+
+    datasets = sorted(
+        runs["dataset"].unique()
+    )
+
+    families = sorted(
+        runs[
+            "surrogate_family"
+        ].unique()
     )
 
     print(
-        f"Saved:\n"
-        f"  {RESULT_DIR / 'runs.csv'}\n"
-        f"  {RESULT_DIR / 'summary.csv'}"
+        f"Seeds found: {seeds}"
+    )
+
+    print(
+        f"Datasets found: "
+        f"{datasets}"
+    )
+
+    print(
+        f"Surrogate families found: "
+        f"{families}"
+    )
+
+    print(
+        f"Total rows: "
+        f"{len(runs)}"
+    )
+
+    # -------------------------------------------------------------
+    # Preserve tidy individual-run data.
+    # -------------------------------------------------------------
+
+    runs = runs.sort_values(
+        [
+            "dataset",
+            "seed",
+            "surrogate_family",
+            "surrogate_config",
+            "boundary_fraction",
+            "boundary_type",
+        ]
+    )
+
+    runs.to_csv(
+        RUNS_PATH,
+        index=False,
+    )
+
+    # =============================================================
+    # 1. Decision-tree capacity sweep
+    # =============================================================
+
+    tree_runs = runs[
+        runs[
+            "is_tree_capacity_sweep"
+        ]
+        & (
+            runs[
+                "surrogate_family"
+            ]
+            == "decision_tree"
+        )
+    ].copy()
+
+    if tree_runs.empty:
+        raise ValueError(
+            "No decision-tree capacity "
+            "sweep rows were found."
+        )
+
+    # depth is blank for non-tree families,
+    # so pandas may have loaded this column
+    # as floating point.
+    tree_runs["depth"] = (
+        tree_runs["depth"]
+        .astype(int)
+    )
+
+    tree_group_cols = [
+        "dataset",
+        "depth",
+        "boundary_type",
+        "boundary_fraction",
+    ]
+
+    tree_summary = summarize(
+        tree_runs,
+        tree_group_cols,
+    )
+
+    # Keep the historical filename so the
+    # existing Figure 1 pipeline can continue
+    # to use summary.csv.
+    tree_summary.to_csv(
+        TREE_SUMMARY_PATH,
+        index=False,
+    )
+
+    # =============================================================
+    # 2. Surrogate-family robustness
+    # =============================================================
+
+    family_runs = runs[
+        runs[
+            "is_family_reference"
+        ]
+    ].copy()
+
+    if family_runs.empty:
+        raise ValueError(
+            "No surrogate-family reference "
+            "rows were found."
+        )
+
+    family_group_cols = [
+        "dataset",
+        "surrogate_family",
+        "surrogate_config",
+        "boundary_type",
+        "boundary_fraction",
+    ]
+
+    family_summary = summarize(
+        family_runs,
+        family_group_cols,
+    )
+
+    # Add a particularly useful robustness
+    # diagnostic: the fraction of seeds for
+    # which boundary fidelity is strictly
+    # lower than global fidelity.
+    positive_gap = (
+        family_runs.assign(
+            positive_boundary_gap=(
+                family_runs[
+                    "boundary_gap"
+                ]
+                > 0
+            )
+        )
+        .groupby(
+            family_group_cols,
+            dropna=False,
+        )[
+            "positive_boundary_gap"
+        ]
+        .mean()
+        .reset_index(
+            name="positive_gap_rate"
+        )
+    )
+
+    family_summary = (
+        family_summary.merge(
+            positive_gap,
+            on=family_group_cols,
+            how="left",
+        )
+    )
+
+    family_summary = (
+        family_summary.sort_values(
+            family_group_cols
+        )
+    )
+
+    family_summary.to_csv(
+        FAMILY_SUMMARY_PATH,
+        index=False,
+    )
+
+    # -------------------------------------------------------------
+    # Console diagnostics
+    # -------------------------------------------------------------
+
+    print()
+    print(
+        "Family-reference configurations:"
+    )
+
+    reference_configs = (
+        family_runs[
+            [
+                "surrogate_family",
+                "surrogate_config",
+            ]
+        ]
+        .drop_duplicates()
+        .sort_values(
+            "surrogate_family"
+        )
+    )
+
+    for row in (
+        reference_configs.itertuples(
+            index=False
+        )
+    ):
+        print(
+            f"  {row.surrogate_family}: "
+            f"{row.surrogate_config}"
+        )
+
+    print()
+    print("Saved:")
+    print(
+        f"  {RUNS_PATH}"
+    )
+    print(
+        f"  {TREE_SUMMARY_PATH} "
+        "(tree-capacity sweep)"
+    )
+    print(
+        f"  {FAMILY_SUMMARY_PATH} "
+        "(cross-family robustness)"
     )
 
 
