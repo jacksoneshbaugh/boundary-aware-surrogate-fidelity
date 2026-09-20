@@ -550,6 +550,7 @@ def parse_args():
 
     parser.add_argument(
         "--tree-depths",
+        "--depths",
         nargs="+",
         type=int,
         default=DEFAULT_TREE_DEPTHS,
