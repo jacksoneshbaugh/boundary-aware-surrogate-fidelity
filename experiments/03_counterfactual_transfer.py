@@ -1,165 +1,593 @@
-"""Idea 6 (fixed): example-based counterfactual/recourse transfer.
-
-Fixes:
-- deterministic seeds
-- split before scaling; fit scaler only on training data
-- logits + BCEWithLogitsLoss; rank-based boundary evaluation
-- only evaluate recourse where teacher and surrogate agree at the starting point
-- transfer succeeds iff the teacher reaches the SURROGATE'S INTENDED TARGET CLASS
-  (the original merely checked whether the teacher changed class)
 """
-import json
+Experiment 3: Example-based counterfactual transfer.
+
+This experiment tests whether high global teacher-surrogate fidelity implies
+that surrogate-derived counterfactual interventions behave similarly under
+the teacher model.
+
+For each test example on which teacher and surrogate initially agree, the
+surrogate identifies the nearest example in a disjoint candidate pool that
+it predicts as the opposite class. The teacher is then evaluated on that
+candidate to determine whether the surrogate's intended prediction change
+transfers.
+
+The data are divided into three disjoint roles:
+
+    - training set:
+        trains the teacher and surrogate
+
+    - candidate set:
+        supplies possible surrogate-derived counterfactual destinations
+
+    - test set:
+        supplies starting examples for counterfactual queries
+
+The experiment records global fidelity, boundary-local fidelity,
+risk-coverage, counterfactual transfer rate, and counterfactual distances
+across surrogate complexities and random seeds.
+
+This is an example-based behavioral stress test rather than a claim about
+actionable real-world recourse: candidate examples are selected by proximity
+in standardized feature space and are not constrained by domain-specific
+actionability or causal feasibility.
+"""
+
+import argparse
+import csv
+from pathlib import Path
+
 import numpy as np
-import torch
-import torch.nn as nn
-from sklearn.datasets import load_breast_cancer, load_wine, load_diabetes
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 
-SEED = 42
+from common import (
+    compute_aurc,
+    load_tabular_datasets,
+    lowest_fraction_mask,
+    teacher_logits,
+    train_mlp_teacher,
+)
 
-class MLP(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 64), nn.ReLU(),
-            nn.Linear(64, 32), nn.ReLU(),
-            nn.Linear(32, 1),
-        )
-    def forward(self, x):
-        return self.net(x)
 
-def compute_aurc(confidence, agreements):
-    order = np.argsort(-confidence, kind="mergesort")
-    sorted_agree = agreements[order]
-    risks = 1.0 - sorted_agree
-    cumulative_risk = np.cumsum(risks)
-    coverages = np.arange(1, len(sorted_agree) + 1) / len(sorted_agree)
-    risk_at_coverage = cumulative_risk / np.arange(1, len(sorted_agree) + 1)
-    trapz = getattr(np, "trapezoid", np.trapz)
-    return float(trapz(risk_at_coverage, coverages))
+DEFAULT_SEEDS = list(range(10))
+DEFAULT_DEPTHS = [2, 3, 5, 7, 10]
+DEFAULT_DATASETS = [
+    "breast_cancer",
+    "wine",
+    "diabetes",
+]
 
-def lowest_fraction_mask(scores, fraction=0.25):
-    k = max(1, int(np.ceil(fraction * len(scores))))
-    idx = np.argsort(scores, kind="mergesort")[:k]
-    mask = np.zeros(len(scores), dtype=bool)
-    mask[idx] = True
-    return mask
 
-def find_recourse(surrogate, x0, X_pool, h_surr_pool):
-    y0 = int(surrogate.predict(x0.reshape(1, -1))[0])
-    target = 1 - y0
-    opp_mask = h_surr_pool == target
-    if not np.any(opp_mask):
-        return None, None, target
-    X_opp = X_pool[opp_mask]
-    dists = np.linalg.norm(X_opp - x0, axis=1)
-    j = int(np.argmin(dists))
-    return X_opp[j], float(dists[j]), target
+def split_train_candidate_test(
+    X,
+    y,
+    seed,
+    train_fraction=0.60,
+    candidate_fraction=0.20,
+):
+    """
+    Split data into disjoint train, candidate, and test sets.
 
-def run_recourse_test(name, X, y):
-    print(f"\n{'='*60}\n  Dataset: {name}\n{'='*60}")
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
+    Scaling parameters are estimated using the training set only.
+    """
+    holdout_fraction = 1.0 - train_fraction
 
-    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
-        X, y, test_size=0.3, random_state=SEED, stratify=y
+    X_train_raw, X_holdout_raw, y_train, y_holdout = train_test_split(
+        X,
+        y,
+        test_size=holdout_fraction,
+        random_state=seed,
+        stratify=y,
     )
+
+    candidate_share_of_holdout = (
+        candidate_fraction / holdout_fraction
+    )
+
+    (
+        X_test_raw,
+        X_candidate_raw,
+        y_test,
+        y_candidate,
+    ) = train_test_split(
+        X_holdout_raw,
+        y_holdout,
+        test_size=candidate_share_of_holdout,
+        random_state=seed + 10_000,
+        stratify=y_holdout,
+    )
+
     scaler = StandardScaler().fit(X_train_raw)
+
     X_train = scaler.transform(X_train_raw)
+    X_candidate = scaler.transform(X_candidate_raw)
     X_test = scaler.transform(X_test_raw)
 
-    X_train_t = torch.tensor(X_train, dtype=torch.float32)
-    y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
-    X_test_t = torch.tensor(X_test, dtype=torch.float32)
+    return (
+        X_train,
+        X_candidate,
+        X_test,
+        y_train,
+        y_candidate,
+        y_test,
+    )
 
-    teacher = MLP(X.shape[1])
-    optimizer = torch.optim.Adam(teacher.parameters(), lr=0.01)
-    criterion = nn.BCEWithLogitsLoss()
-    teacher.train()
-    for _ in range(500):
-        optimizer.zero_grad()
-        loss = criterion(teacher(X_train_t), y_train_t)
-        loss.backward()
-        optimizer.step()
 
-    teacher.eval()
-    with torch.no_grad():
-        test_logits = teacher(X_test_t).numpy().flatten()
-        train_logits = teacher(X_train_t).numpy().flatten()
-    h_teacher_test = (test_logits >= 0.0).astype(int)
-    h_teacher_train = (train_logits >= 0.0).astype(int)
-    confidence = np.abs(test_logits)
-    boundary_mask = lowest_fraction_mask(confidence, 0.25)
+def find_example_based_counterfactual(
+    surrogate,
+    x0,
+    X_candidate,
+    surrogate_candidate_predictions,
+):
+    """
+    Find the nearest candidate example assigned to the opposite class
+    by the surrogate.
+    """
+    start_class = int(
+        surrogate.predict(
+            x0.reshape(1, -1)
+        )[0]
+    )
 
-    results = {"dataset": name, "surrogates": []}
-    for depth in [2, 3, 5, 7, 10]:
-        dt = DecisionTreeClassifier(max_depth=depth, random_state=SEED)
-        dt.fit(X_train, h_teacher_train)
-        h_surr_test = dt.predict(X_test)
-        h_surr_train = dt.predict(X_train)
-        agreement = (h_surr_test == h_teacher_test).astype(float)
+    target_class = 1 - start_class
 
-        global_fid = float(np.mean(agreement))
-        boundary_fid = float(np.mean(agreement[boundary_mask]))
-        aurc = compute_aurc(confidence, agreement)
+    target_mask = (
+        surrogate_candidate_predictions
+        == target_class
+    )
+
+    if not np.any(target_mask):
+        return None, None, target_class
+
+    candidates = X_candidate[target_mask]
+
+    distances = np.linalg.norm(
+        candidates - x0,
+        axis=1,
+    )
+
+    nearest = int(np.argmin(distances))
+
+    return (
+        candidates[nearest],
+        float(distances[nearest]),
+        target_class,
+    )
+
+
+def run_dataset(
+    dataset_name,
+    X,
+    y,
+    seed,
+    depths,
+    epochs,
+    boundary_fraction,
+):
+    (
+        X_train,
+        X_candidate,
+        X_test,
+        y_train,
+        y_candidate,
+        y_test,
+    ) = split_train_candidate_test(
+        X,
+        y,
+        seed=seed,
+    )
+
+    teacher = train_mlp_teacher(
+        X_train,
+        y_train,
+        seed=seed,
+        epochs=epochs,
+    )
+
+    train_logits = teacher_logits(
+        teacher,
+        X_train,
+    )
+
+    candidate_logits = teacher_logits(
+        teacher,
+        X_candidate,
+    )
+
+    test_logits = teacher_logits(
+        teacher,
+        X_test,
+    )
+
+    teacher_train = (
+        train_logits >= 0.0
+    ).astype(int)
+
+    teacher_candidate = (
+        candidate_logits >= 0.0
+    ).astype(int)
+
+    teacher_test = (
+        test_logits >= 0.0
+    ).astype(int)
+
+    confidence_test = np.abs(test_logits)
+
+    boundary_mask = lowest_fraction_mask(
+        confidence_test,
+        boundary_fraction,
+    )
+
+    teacher_accuracy = float(
+        np.mean(teacher_test == y_test)
+    )
+
+    summary_rows = []
+    query_rows = []
+
+    for depth in depths:
+        surrogate = DecisionTreeClassifier(
+            max_depth=depth,
+            random_state=seed,
+        )
+
+        surrogate.fit(
+            X_train,
+            teacher_train,
+        )
+
+        surrogate_test = surrogate.predict(
+            X_test
+        )
+
+        surrogate_candidate = surrogate.predict(
+            X_candidate
+        )
+
+        agreement = (
+            surrogate_test == teacher_test
+        ).astype(float)
+
+        global_fidelity = float(
+            np.mean(agreement)
+        )
+
+        boundary_fidelity = float(
+            np.mean(
+                agreement[boundary_mask]
+            )
+        )
+
+        aurc = compute_aurc(
+            confidence_test,
+            agreement,
+        )
 
         transfers = 0
-        fails = 0
-        total_recourse = 0
+        failures = 0
+        no_candidate = 0
         excluded_initial_disagreement = 0
+
         distances = []
 
-        for i in range(len(X_test)):
-            # A surrogate recommendation only has a well-defined transfer target if the
-            # surrogate is faithful at the starting point.
-            if h_surr_test[i] != h_teacher_test[i]:
+        for test_index, x0 in enumerate(X_test):
+            # Transfer is interpretable only when teacher and surrogate
+            # agree on the starting prediction.
+            if (
+                surrogate_test[test_index]
+                != teacher_test[test_index]
+            ):
                 excluded_initial_disagreement += 1
                 continue
 
-            x_cf, dist, target = find_recourse(dt, X_test[i], X_train, h_surr_train)
+            (
+                x_cf,
+                distance,
+                target_class,
+            ) = find_example_based_counterfactual(
+                surrogate,
+                x0,
+                X_candidate,
+                surrogate_candidate,
+            )
+
             if x_cf is None:
+                no_candidate += 1
                 continue
-            total_recourse += 1
-            distances.append(dist)
 
-            with torch.no_grad():
-                teacher_at_cf = int(teacher(torch.tensor(x_cf, dtype=torch.float32).unsqueeze(0)).item() >= 0.0)
+            teacher_cf_logit = teacher_logits(
+                teacher,
+                x_cf.reshape(1, -1),
+            )[0]
 
-            if teacher_at_cf == target:
-                transfers += 1
-            else:
-                fails += 1
+            teacher_cf_class = int(
+                teacher_cf_logit >= 0.0
+            )
 
-        transfer_rate = transfers / total_recourse if total_recourse > 0 else np.nan
-        s = {
-            "depth": depth,
-            "global_fidelity": global_fid,
-            "boundary_fidelity": boundary_fid,
-            "aurc": aurc,
-            "recourse_transfer_rate": float(transfer_rate),
-            "total_recourse_attempts": int(total_recourse),
-            "transfers": int(transfers),
-            "fails": int(fails),
-            "excluded_initial_disagreement": int(excluded_initial_disagreement),
-            "mean_recourse_distance": float(np.mean(distances)) if distances else None,
-        }
-        results["surrogates"].append(s)
-        print(
-            f"  d={depth:2d} | GlobFid={global_fid:.4f} | BoundFid={boundary_fid:.4f} | "
-            f"AURC={aurc:.4f} | Transfer={transfer_rate:.4f} ({transfers}/{total_recourse}) | "
-            f"excluded={excluded_initial_disagreement}"
+            success = (
+                teacher_cf_class
+                == target_class
+            )
+
+            transfers += int(success)
+            failures += int(not success)
+            distances.append(distance)
+
+            query_rows.append(
+                {
+                    "dataset": dataset_name,
+                    "seed": seed,
+                    "depth": depth,
+                    "test_index": test_index,
+
+                    "start_teacher_class":
+                        int(teacher_test[test_index]),
+
+                    "start_surrogate_class":
+                        int(surrogate_test[test_index]),
+
+                    "target_class":
+                        int(target_class),
+
+                    "start_teacher_confidence":
+                        float(
+                            confidence_test[test_index]
+                        ),
+
+                    "counterfactual_distance":
+                        float(distance),
+
+                    "teacher_counterfactual_class":
+                        teacher_cf_class,
+
+                    "transfer_success":
+                        bool(success),
+                }
+            )
+
+        total_attempts = (
+            transfers + failures
         )
-    return results
 
-def datasets():
-    d = load_breast_cancer(); bc = (d.data, d.target)
-    d = load_wine(); wine = (d.data, (d.target == 0).astype(int))
-    d = load_diabetes(); med = np.median(d.target); diab = (d.data, (d.target >= med).astype(int))
-    return {"Breast_Cancer": bc, "Wine": wine, "Diabetes": diab}
+        transfer_rate = (
+            transfers / total_attempts
+            if total_attempts > 0
+            else np.nan
+        )
 
-all_results = [run_recourse_test(name, X, y) for name, (X, y) in datasets().items()]
-with open("idea6_recourse_transfer_results_fixed.json", "w") as f:
-    json.dump(all_results, f, indent=2, allow_nan=False)
-print("\nDone!")
+        eligible_starts = (
+            len(X_test)
+            - excluded_initial_disagreement
+        )
+
+        summary_rows.append(
+            {
+                "dataset": dataset_name,
+                "seed": seed,
+                "depth": depth,
+
+                "teacher_accuracy":
+                    teacher_accuracy,
+
+                "n_train":
+                    len(X_train),
+
+                "n_candidate":
+                    len(X_candidate),
+
+                "n_test":
+                    len(X_test),
+
+                "global_fidelity":
+                    global_fidelity,
+
+                "boundary_fraction":
+                    boundary_fraction,
+
+                "boundary_fidelity":
+                    boundary_fidelity,
+
+                "aurc":
+                    aurc,
+
+                "eligible_start_points":
+                    eligible_starts,
+
+                "excluded_initial_disagreement":
+                    excluded_initial_disagreement,
+
+                "no_counterfactual_candidate":
+                    no_candidate,
+
+                "total_recourse_attempts":
+                    total_attempts,
+
+                "transfers":
+                    transfers,
+
+                "failures":
+                    failures,
+
+                "recourse_transfer_rate":
+                    float(transfer_rate),
+
+                "mean_recourse_distance":
+                    (
+                        float(np.mean(distances))
+                        if distances
+                        else np.nan
+                    ),
+
+                "median_recourse_distance":
+                    (
+                        float(np.median(distances))
+                        if distances
+                        else np.nan
+                    ),
+            }
+        )
+
+        print(
+            f"{dataset_name:14s} | "
+            f"seed={seed:2d} | "
+            f"d={depth:2d} | "
+            f"global={global_fidelity:.3f} | "
+            f"boundary={boundary_fidelity:.3f} | "
+            f"transfer={transfer_rate:.3f} "
+            f"({transfers}/{total_attempts}) | "
+            f"excluded="
+            f"{excluded_initial_disagreement} | "
+            f"no-candidate={no_candidate}"
+        )
+
+    return summary_rows, query_rows
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        default=DEFAULT_DATASETS,
+    )
+
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=DEFAULT_SEEDS,
+    )
+
+    parser.add_argument(
+        "--depths",
+        nargs="+",
+        type=int,
+        default=DEFAULT_DEPTHS,
+    )
+
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=500,
+    )
+
+    parser.add_argument(
+        "--boundary-fraction",
+        type=float,
+        default=0.25,
+    )
+
+    parser.add_argument(
+        "--output",
+        default=(
+            "results/counterfactual_transfer/"
+            "runs.csv"
+        ),
+    )
+
+    parser.add_argument(
+        "--query-output",
+        default=None,
+    )
+
+    return parser.parse_args()
+
+
+def write_csv(path, rows):
+    if not rows:
+        return
+
+    path = Path(path)
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with path.open(
+        "w",
+        newline="",
+    ) as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=list(
+                rows[0].keys()
+            ),
+        )
+
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def main(args):
+    datasets = load_tabular_datasets()
+
+    unknown = (
+        set(args.datasets)
+        - set(datasets.keys())
+    )
+
+    if unknown:
+        raise ValueError(
+            f"Unknown datasets: "
+            f"{sorted(unknown)}"
+        )
+
+    summary_rows = []
+    query_rows = []
+
+    for dataset_name in args.datasets:
+        X, y = datasets[dataset_name]
+
+        for seed in args.seeds:
+            summaries, queries = run_dataset(
+                dataset_name,
+                X,
+                y,
+                seed=seed,
+                depths=args.depths,
+                epochs=args.epochs,
+                boundary_fraction=(
+                    args.boundary_fraction
+                ),
+            )
+
+            summary_rows.extend(summaries)
+            query_rows.extend(queries)
+
+    output = Path(args.output)
+
+    write_csv(
+        output,
+        summary_rows,
+    )
+
+    query_output = (
+        Path(args.query_output)
+        if args.query_output
+        else output.with_name(
+            output.stem
+            + "_queries.csv"
+        )
+    )
+
+    write_csv(
+        query_output,
+        query_rows,
+    )
+
+    print(
+        f"\nSaved {len(summary_rows)} "
+        f"summary rows to {output}"
+    )
+
+    print(
+        f"Saved {len(query_rows)} "
+        f"query rows to {query_output}"
+    )
+
+
+if __name__ == "__main__":
+    main(parse_args())
