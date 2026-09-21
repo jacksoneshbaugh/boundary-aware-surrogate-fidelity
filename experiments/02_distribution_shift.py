@@ -17,13 +17,18 @@ The primary comparison is:
     - prediction from source global fidelity
     - prediction from the source confidence-stratified fidelity profile
 
-Predicted target fidelity is compared with actually observed target fidelity
-across datasets, surrogate complexities, distribution shifts, and random
-seeds.
+By default, this script reproduces the original decision-tree capacity sweep.
+With --family-check, it instead runs one representative configuration from
+four surrogate families:
 
-The experiment evaluates whether retaining conditional information about
-where surrogate agreement occurs improves fidelity estimation when evaluation
-mass shifts across regions of the teacher's decision space.
+    - decision tree, depth 5
+    - logistic regression, C = 1
+    - k-NN, k = 5
+    - one-hidden-layer MLP, width 32
+
+The family check is a robustness extension of the same experiment: teacher
+training, data splits, source/target roles, confidence bins, target shifts,
+and prediction-error calculations are unchanged.
 """
 
 import argparse
@@ -31,7 +36,10 @@ import csv
 from pathlib import Path
 
 import numpy as np
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neural_network import MLPClassifier
 from sklearn.tree import DecisionTreeClassifier
 
 from common import (
@@ -48,6 +56,12 @@ DEFAULT_DATASETS = [
     "breast_cancer",
     "wine",
     "diabetes",
+]
+DEFAULT_FAMILIES = [
+    "decision_tree",
+    "logistic_regression",
+    "knn",
+    "mlp",
 ]
 
 
@@ -153,12 +167,123 @@ def predict_from_profile(
     return float(np.mean(predictions))
 
 
+def make_surrogate(
+    family,
+    seed,
+    depth=None,
+):
+    """Construct one surrogate model."""
+    if family == "decision_tree":
+        if depth is None:
+            raise ValueError(
+                "Decision-tree surrogate requires a max depth."
+            )
+
+        return DecisionTreeClassifier(
+            max_depth=depth,
+            random_state=seed,
+        )
+
+    if family == "logistic_regression":
+        return LogisticRegression(
+            C=1.0,
+            solver="liblinear",
+            max_iter=5000,
+            random_state=seed,
+        )
+
+    if family == "knn":
+        return KNeighborsClassifier(
+            n_neighbors=5,
+        )
+
+    if family == "mlp":
+        return MLPClassifier(
+            hidden_layer_sizes=(32,),
+            activation="relu",
+            solver="lbfgs",
+            max_iter=5000,
+            random_state=seed,
+        )
+
+    raise ValueError(
+        f"Unknown surrogate family: {family}"
+    )
+
+
+def surrogate_configs(
+    family_check,
+    depths,
+    families,
+):
+    """
+    Return the surrogate configurations for this run.
+
+    Default mode preserves the original decision-tree depth sweep.
+    Family-check mode uses one representative configuration per family.
+    """
+    if not family_check:
+        return [
+            {
+                "family": "decision_tree",
+                "depth": depth,
+                "config": f"depth={depth}",
+            }
+            for depth in depths
+        ]
+
+    unknown = set(families) - set(DEFAULT_FAMILIES)
+
+    if unknown:
+        raise ValueError(
+            f"Unknown surrogate families: {sorted(unknown)}"
+        )
+
+    configs = []
+
+    for family in families:
+        if family == "decision_tree":
+            configs.append(
+                {
+                    "family": family,
+                    "depth": 5,
+                    "config": "depth=5",
+                }
+            )
+        elif family == "logistic_regression":
+            configs.append(
+                {
+                    "family": family,
+                    "depth": None,
+                    "config": "C=1,solver=liblinear",
+                }
+            )
+        elif family == "knn":
+            configs.append(
+                {
+                    "family": family,
+                    "depth": None,
+                    "config": "k=5",
+                }
+            )
+        elif family == "mlp":
+            configs.append(
+                {
+                    "family": family,
+                    "depth": None,
+                    "config": "hidden_width=32,solver=lbfgs",
+                }
+            )
+
+    return configs
+
+
 def run_dataset(
     dataset_name,
     X,
     y,
     seed,
-    depths,
+    configs,
     n_bins,
     epochs,
 ):
@@ -227,10 +352,15 @@ def run_dataset(
 
     rows = []
 
-    for depth in depths:
-        surrogate = DecisionTreeClassifier(
-            max_depth=depth,
-            random_state=seed,
+    for config in configs:
+        family = config["family"]
+        depth = config["depth"]
+        config_name = config["config"]
+
+        surrogate = make_surrogate(
+            family,
+            seed=seed,
+            depth=depth,
         )
 
         surrogate.fit(
@@ -283,6 +413,7 @@ def run_dataset(
             np.median(target_confidence_all)
         )
 
+        # Preserve the original Experiment 2 shift definitions exactly.
         shifts = {
             "hard": (
                 target_confidence_all
@@ -340,6 +471,8 @@ def run_dataset(
                 {
                     "dataset": dataset_name,
                     "seed": seed,
+                    "surrogate_family": family,
+                    "surrogate_config": config_name,
                     "depth": depth,
                     "shift": shift_name,
 
@@ -403,10 +536,17 @@ def run_dataset(
                 else "GLOBAL/TIE"
             )
 
+            depth_text = (
+                f"d={depth:2d}"
+                if depth is not None
+                else "d=--"
+            )
+
             print(
                 f"{dataset_name:14s} | "
                 f"seed={seed:2d} | "
-                f"d={depth:2d} | "
+                f"{family:19s} | "
+                f"{depth_text} | "
                 f"{shift_name:4s} | "
                 f"true={true_target_fidelity:.3f} | "
                 f"global={pred_global:.3f} "
@@ -440,6 +580,30 @@ def parse_args():
         nargs="+",
         type=int,
         default=DEFAULT_DEPTHS,
+        help=(
+            "Decision-tree depths for the original capacity sweep. "
+            "Ignored when --family-check is set."
+        ),
+    )
+
+    parser.add_argument(
+        "--family-check",
+        action="store_true",
+        help=(
+            "Run representative decision-tree, logistic-regression, "
+            "k-NN, and MLP surrogates instead of the decision-tree "
+            "depth sweep."
+        ),
+    )
+
+    parser.add_argument(
+        "--families",
+        nargs="+",
+        default=DEFAULT_FAMILIES,
+        choices=DEFAULT_FAMILIES,
+        help=(
+            "Surrogate families to include in --family-check mode."
+        ),
     )
 
     parser.add_argument(
@@ -456,9 +620,12 @@ def parse_args():
 
     parser.add_argument(
         "--output",
-        default=(
-            "results/distribution_shift/"
-            "runs.csv"
+        default=None,
+        help=(
+            "Output CSV path. If omitted, the original depth sweep "
+            "writes results/distribution_shift/runs.csv and the "
+            "family check writes "
+            "results/distribution_shift/family_runs.csv."
         ),
     )
 
@@ -478,6 +645,12 @@ def main(args):
             f"Unknown datasets: {sorted(unknown)}"
         )
 
+    configs = surrogate_configs(
+        family_check=args.family_check,
+        depths=args.depths,
+        families=args.families,
+    )
+
     rows = []
 
     for dataset_name in args.datasets:
@@ -490,13 +663,24 @@ def main(args):
                     X,
                     y,
                     seed=seed,
-                    depths=args.depths,
+                    configs=configs,
                     n_bins=args.bins,
                     epochs=args.epochs,
                 )
             )
 
-    output = Path(args.output)
+    if args.output is not None:
+        output = Path(args.output)
+    elif args.family_check:
+        output = Path(
+            "results/distribution_shift/"
+            "family_runs.csv"
+        )
+    else:
+        output = Path(
+            "results/distribution_shift/"
+            "runs.csv"
+        )
 
     output.parent.mkdir(
         parents=True,
