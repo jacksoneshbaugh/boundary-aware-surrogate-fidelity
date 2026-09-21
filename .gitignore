@@ -41,7 +41,13 @@ slurm.*.out
 *.npz
 
 # Generated experiment outputs
-results/*
+
+# Per-run / per-seed experiment outputs
+results/**/*_seed_*.csv
+
+# Temporary experiment outputs
+results/**/_*.csv
+
 !results/.gitkeep
 
 # Generated figures
