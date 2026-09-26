@@ -122,7 +122,7 @@ def print_headline_stats(runs, mode):
     profile = runs["error_profile"].to_numpy(float)
     global_ = runs["error_global"].to_numpy(float)
 
-    ties_mask = np.isclose(profile, global_)
+    ties_mask = profile == global_
     wins = int(np.sum((profile < global_) & ~ties_mask))
     losses = int(np.sum((profile > global_) & ~ties_mask))
     ties = int(np.sum(ties_mask))
