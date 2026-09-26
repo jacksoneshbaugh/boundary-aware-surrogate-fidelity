@@ -1235,10 +1235,15 @@ def make_distribution_shift_figure():
             label="Stratified profile",
         )
 
+        shift_labels = {
+            "hard": "Lower confidence",
+            "easy": "Higher confidence",
+        }
+
         ax.set_xticks(
             x,
             [
-                shift.capitalize()
+                shift_labels.get(shift, str(shift))
                 for shift in shifts
             ],
         )
