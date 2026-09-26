@@ -12,10 +12,11 @@ Outputs
 -------
 figures/
     fig_boundary_fidelity.pdf/png
-    fig_boundary_fidelity_families.pdf/png
     fig_distribution_shift.pdf/png
     fig_counterfactual_transfer.pdf/png
     fig_deep_boundary_stability.pdf/png
+    appendix/
+        fig_boundary_fidelity_families.pdf/png
 
 Uncertainty intervals
 ---------------------
@@ -27,11 +28,12 @@ from the same seed as independent replicates.
 Experiment 1 now contains two complementary views:
 
     1. fig_boundary_fidelity
-       Original decision-tree capacity sweep.
+       Main-text decision-tree capacity sweep.
 
-    2. fig_boundary_fidelity_families
-       Cross-family robustness at a fixed 25% boundary fraction, using the
-       designated representative configuration for each surrogate family.
+    2. appendix/fig_boundary_fidelity_families
+       Appendix cross-family robustness across all evaluated boundary
+       fractions, using the designated representative configuration for each
+       surrogate family.
 """
 
 from pathlib import Path
@@ -79,6 +81,11 @@ DEEP_STABILITY_FILE = (
 FIGURE_DIR = (
     ROOT
     / "figures"
+)
+
+APPENDIX_FIGURE_DIR = (
+    FIGURE_DIR
+    / "appendix"
 )
 
 
@@ -326,19 +333,20 @@ def mean_ci(values):
 def save_figure(
     fig,
     stem,
+    output_dir=FIGURE_DIR,
 ):
-    FIGURE_DIR.mkdir(
+    output_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     pdf = (
-        FIGURE_DIR
+        output_dir
         / f"{stem}.pdf"
     )
 
     png = (
-        FIGURE_DIR
+        output_dir
         / f"{stem}.png"
     )
 
@@ -609,7 +617,7 @@ def make_boundary_figure():
         )
 
         ax.set_xlabel(
-            "Boundary-region size (%)"
+            "Boundary fraction (%)"
         )
 
         ax.grid(
@@ -666,13 +674,24 @@ def make_boundary_figure():
 
 
 # =====================================================================
-# Figure 1b:
-# Surrogate-family robustness at 25% boundary fraction
+# Appendix Figure B.1:
+# Surrogate-family robustness across boundary fractions
 # =====================================================================
 
-def make_boundary_family_figure(
-    boundary_fraction=0.25,
-):
+def make_boundary_family_fraction_figure():
+    """
+    Appendix figure:
+    surrogate-family robustness across all evaluated boundary fractions.
+
+    Rows correspond to boundary-proximity definitions:
+        1. Confidence
+        2. Segment-crossing proxy
+
+    Columns correspond to datasets.
+
+    Curves show mean global-to-boundary fidelity gaps across ten seeds,
+    with approximate 95% confidence intervals.
+    """
     df = pd.read_csv(
         BOUNDARY_FILE
     )
@@ -697,7 +716,7 @@ def make_boundary_family_figure(
     if missing:
         raise ValueError(
             "Boundary results missing columns "
-            "for surrogate-family comparison: "
+            "for surrogate-family appendix figure: "
             f"{sorted(missing)}"
         )
 
@@ -709,22 +728,18 @@ def make_boundary_family_figure(
         ]
     )
 
+    # Only the designated representative configuration
+    # from each surrogate family belongs in this figure.
     df = df[
         df[
             "is_family_reference"
         ]
-        & np.isclose(
-            df[
-                "boundary_fraction"
-            ],
-            boundary_fraction,
-        )
     ].copy()
 
     if df.empty:
         raise ValueError(
             "No family-reference rows were found "
-            f"at boundary fraction {boundary_fraction}."
+            "for the appendix robustness figure."
         )
 
     df["boundary_gap"] = (
@@ -768,10 +783,7 @@ def make_boundary_family_figure(
 
     palette = sns.color_palette(
         "colorblind",
-        n_colors=max(
-            2,
-            len(boundary_types),
-        ),
+        n_colors=len(families),
     )
 
     markers = [
@@ -781,150 +793,232 @@ def make_boundary_family_figure(
         "D",
     ]
 
-    x = np.arange(
-        len(families)
-    )
-
-    if len(boundary_types) == 1:
-        offsets = np.array(
-            [0.0]
-        )
-    else:
-        offsets = np.linspace(
-            -0.10,
-            0.10,
-            len(boundary_types),
-        )
-
     fig, axes = plt.subplots(
-        1,
+        len(boundary_types),
         len(datasets),
-        figsize=(7.15, 2.45),
+        figsize=(7.4, 4.4),
         sharey=True,
+        sharex=True,
     )
 
-    if len(datasets) == 1:
-        axes = [axes]
+    # Handle degenerate cases cleanly.
+    axes = np.atleast_2d(
+        axes
+    )
 
-    for ax, dataset in zip(
-        axes,
-        datasets,
+    for row_index, boundary_type in enumerate(
+        boundary_types
     ):
-        dataset_part = df[
-            df[
-                "dataset"
-            ]
-            == dataset
-        ]
-
-        for type_index, boundary_type in enumerate(
-            boundary_types
+        for col_index, dataset in enumerate(
+            datasets
         ):
-            means = []
-            cis = []
+            ax = axes[
+                row_index,
+                col_index,
+            ]
 
-            for family in families:
-                group = dataset_part[
-                    (
-                        dataset_part[
-                            "surrogate_family"
-                        ]
-                        == family
-                    )
-                    & (
-                        dataset_part[
-                            "boundary_type"
-                        ]
-                        == boundary_type
-                    )
+            subset = df[
+                (
+                    df[
+                        "dataset"
+                    ]
+                    == dataset
+                )
+                & (
+                    df[
+                        "boundary_type"
+                    ]
+                    == boundary_type
+                )
+            ]
+
+            for family_index, family in enumerate(
+                families
+            ):
+                part = subset[
+                    subset[
+                        "surrogate_family"
+                    ]
+                    == family
                 ]
 
-                mean, ci = mean_ci(
-                    group[
-                        "boundary_gap"
-                    ]
+                if part.empty:
+                    continue
+
+                rows = []
+
+                for (
+                    fraction,
+                    group,
+                ) in part.groupby(
+                    "boundary_fraction"
+                ):
+                    mean, ci = mean_ci(
+                        group[
+                            "boundary_gap"
+                        ]
+                    )
+
+                    rows.append(
+                        {
+                            "fraction":
+                                fraction,
+
+                            "mean":
+                                mean,
+
+                            "ci":
+                                ci,
+                        }
+                    )
+
+                curve = (
+                    pd.DataFrame(
+                        rows
+                    )
+                    .sort_values(
+                        "fraction"
+                    )
                 )
 
-                means.append(
-                    mean * 100
+                ax.errorbar(
+                    curve[
+                        "fraction"
+                    ] * 100,
+
+                    curve[
+                        "mean"
+                    ] * 100,
+
+                    yerr=(
+                        curve[
+                            "ci"
+                        ] * 100
+                    ),
+
+                    color=palette[
+                        family_index
+                    ],
+
+                    marker=markers[
+                        family_index
+                    ],
+
+                    markeredgewidth=0.7,
+                    capsize=2.5,
+                    elinewidth=1.0,
+                    linewidth=1.6,
+
+                    label=surrogate_label(
+                        family
+                    ),
                 )
 
-                cis.append(
-                    ci * 100
-                )
-
-            ax.errorbar(
-                x
-                + offsets[
-                    type_index
-                ],
-
-                means,
-
-                yerr=cis,
-
-                fmt=markers[
-                    type_index
-                ],
-
-                color=palette[
-                    type_index
-                ],
-
-                markersize=5.5,
-                markeredgewidth=0.7,
-                capsize=2.5,
-                elinewidth=1.0,
-                linewidth=0,
-
-                label=boundary_type_label(
-                    boundary_type
-                ),
+            ax.axhline(
+                0,
+                color="0.45",
+                linewidth=0.75,
+                linestyle="--",
+                zorder=0,
             )
 
-        ax.axhline(
-            0,
-            color="0.45",
-            linewidth=0.75,
-            linestyle="--",
-            zorder=0,
-        )
-
-        ax.set_xticks(
-            x,
-            [
-                surrogate_label(
-                    family
+            if row_index == 0:
+                ax.set_title(
+                    dataset_label(
+                        dataset
+                    ),
+                    pad=6,
                 )
-                for family
-                in families
-            ],
-            rotation=25,
-            ha="right",
-        )
 
-        ax.set_title(
-            dataset_label(
-                dataset
+            if row_index == (
+                len(boundary_types) - 1
+            ):
+                ax.set_xlabel(
+                    "Boundary fraction (%)"
+                )
+
+            ax.set_xticks(
+                [10, 20, 25, 40]
+            )
+
+            ax.grid(
+                axis="x",
+                visible=False,
+            )
+
+            sns.despine(
+                ax=ax,
+            )
+
+    # -------------------------------------------------------------
+    # Row identifiers.
+    #
+    # These are categorical facet labels rather than axis labels,
+    # so place them inside the first panel of each row.
+    # -------------------------------------------------------------
+
+    row_labels = {
+        "confidence":
+            "Confidence",
+
+        "segment_crossing":
+            "Segment-crossing proxy",
+    }
+
+    for row_index, boundary_type in enumerate(
+        boundary_types
+    ):
+        axes[
+            row_index,
+            0,
+        ].text(
+            0.04,
+            0.93,
+            row_labels.get(
+                boundary_type,
+                boundary_type_label(
+                    boundary_type
+                ),
             ),
-            pad=6,
+
+            transform=axes[
+                row_index,
+                0,
+            ].transAxes,
+
+            ha="left",
+            va="top",
+            fontsize=8.5,
+            fontweight="semibold",
+
+            bbox={
+                "facecolor":
+                    "white",
+
+                "edgecolor":
+                    "none",
+
+                "alpha":
+                    0.85,
+
+                "pad":
+                    1.5,
+            },
         )
 
-        ax.grid(
-            axis="x",
-            visible=False,
-        )
-
-        sns.despine(
-            ax=ax,
-        )
-
-    axes[0].set_ylabel(
-        "Global − boundary fidelity (pp)"
+    # One shared quantitative y-axis label for both rows.
+    fig.supylabel(
+        "Global − boundary fidelity (pp)",
+        x=0.012,
+        fontsize=9,
     )
 
+    # Shared legend across the top.
     handles, labels = (
-        axes[-1]
+        axes[
+            0,
+            -1,
+        ]
         .get_legend_handles_labels()
     )
 
@@ -935,7 +1029,7 @@ def make_boundary_family_figure(
             loc="upper center",
             bbox_to_anchor=(
                 0.5,
-                1.07,
+                1.01,
             ),
             ncol=len(
                 handles
@@ -946,16 +1040,17 @@ def make_boundary_family_figure(
     fig.tight_layout(
         pad=0.6,
         rect=(
-            0,
+            0.035,
             0,
             1,
-            0.92,
+            0.94,
         ),
     )
 
     save_figure(
         fig,
         "fig_boundary_fidelity_families",
+        output_dir=APPENDIX_FIGURE_DIR,
     )
 
     plt.close(
@@ -1744,7 +1839,7 @@ def make_deep_stability_figure():
         )
 
     ax.set_xlabel(
-        "Boundary-region size (%)"
+        "Boundary fraction (%)"
     )
 
     ax.set_ylabel(
@@ -1752,7 +1847,7 @@ def make_deep_stability_figure():
     )
 
     ax.set_title(
-        "Boundary-region stability"
+        "Boundary-set stability"
     )
 
     # Keep an absolute 0--100 scale so overlap
@@ -1827,15 +1922,15 @@ def make_deep_stability_figure():
     )
 
     ax.set_xlabel(
-        "Boundary-region size (%)"
+        "Boundary fraction (%)"
     )
 
     ax.set_ylabel(
-        "Global − boundary agreement (pp)"
+        "Global − union agreement (pp)"
     )
 
     ax.set_title(
-        "Agreement degradation near boundary"
+        "Agreement drop on boundary-set union"
     )
 
     ax.grid(
@@ -1882,13 +1977,11 @@ def main():
     print()
 
     print(
-        "Generating Experiment 1 "
-        "surrogate-family robustness figure..."
+        "Generating Experiment 1 appendix "
+        "surrogate-family fraction figure..."
     )
 
-    make_boundary_family_figure(
-        boundary_fraction=0.25,
-    )
+    make_boundary_family_fraction_figure()
 
     print()
 
